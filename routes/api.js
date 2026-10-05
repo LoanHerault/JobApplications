@@ -19,6 +19,9 @@ var router = express.Router();
 var APP_ROOT = process.cwd();
 var ENV_PATH = path.join(APP_ROOT, '.env');
 
+// execFile timeout for the one-time login + search step (scripts/jobup-search.js).
+var SEARCH_SCRIPT_TIMEOUT_MS = 180000;
+
 // Reads the CURRENT credentials straight from the .env file on disk — not from this process's own
 // `process.env`, which dotenv only populated once, at server startup, via app.js's
 // `require('dotenv').config()`. scripts/jobup-login.js rewrites that file in place on a successful
@@ -103,7 +106,7 @@ function spawnScript(current, command, args, options) {
   return new Promise(function(resolve) {
     var child = execFile(command, args, options, function(err, stdout, stderr) {
       current.processes.delete(child);
-      resolve({ stdout: stdout, stderr: stderr });
+      resolve({ stdout: stdout, stderr: stderr, err: err });
     });
     current.processes.add(child);
   });
@@ -120,7 +123,11 @@ async function runSearchScript(current, useBasicSearch, searchTerm, locations, u
     'node',
     [scriptPath, String(useBasicSearch), searchTerm, JSON.stringify(locations), String(useJobsCh)],
     {
-      timeout: 90000,
+      // Raised from 90s: confirmed live, the sub-nav-tab fallback path (25s + 15s + 10s CTA waits
+      // before even reaching the tab, then mode detection, the profile-button re-check, and the
+      // direct-URL navigation) plus login can legitimately exceed 90s, which killed the script
+      // with empty stdout and surfaced only as an opaque "could not parse script output".
+      timeout: SEARCH_SCRIPT_TIMEOUT_MS,
       env: Object.assign({}, process.env, readCurrentJobupCredentials(useJobsCh))
     }
   );
@@ -129,6 +136,11 @@ async function runSearchScript(current, useBasicSearch, searchTerm, locations, u
   }
 
   var result = { success: false, errorMessage: null, totalJobsCount: null, resultsUrl: null, storageStatePath: null };
+  if (spawned.err && spawned.err.killed && !current.stoppedByUser) {
+    console.error('[jobup-search] search script timed out after ' + (SEARCH_SCRIPT_TIMEOUT_MS / 1000) + 's and was killed.');
+    result.errorMessage = 'The job search took too long and was stopped';
+    return result;
+  }
   try {
     var parsed = JSON.parse(spawned.stdout.trim());
     result.success = !!parsed.success;

@@ -283,14 +283,30 @@ async function runSearch(email, password, useBasicSearch, searchTerm, locations,
       // mode. Ensure Intelligent search mode first (no-op if already there) and look there for
       // "Rechercher avec mon profil" — reusing the profile-matched CTA flow gives a real
       // profile-derived search term instead of RECOVERY_SEARCH_TERM, so it's preferred here.
-      const switchedToIntelligent = await switchModeIfLinkPresent(goToIntelligentSearchLink);
+      // The two mode-switch links are mutually exclusive, so wait for *either* one rather than
+      // waiting out the full timeout on "Aller à la recherche intelligente" when the page is
+      // already in Intelligent search mode (confirmed live: that wasted 10s per run and pushed
+      // the whole search past routes/api.js's execFile timeout, while the diagnostic below
+      // showed "Aller à la recherche basique" visible — i.e. the expected, already-intelligent
+      // state, not a selector problem).
+      const eitherModeLinkVisible = await goToIntelligentSearchLink
+        .or(basicSearchLink)
+        .first()
+        .waitFor({ state: 'visible', timeout: 10000 })
+        .then(() => true)
+        .catch(() => false);
+      const alreadyIntelligent = eitherModeLinkVisible && (await basicSearchLink.first().isVisible());
+      const switchedToIntelligent =
+        eitherModeLinkVisible && !alreadyIntelligent && (await switchModeIfLinkPresent(goToIntelligentSearchLink, 2000));
       console.error(
         switchedToIntelligent
           ? 'entered via the sub-nav tab; clicked "Aller à la recherche intelligente".'
-          : 'entered via the sub-nav tab, already in Intelligent search mode (or the ' +
-              'link was not found).'
+          : alreadyIntelligent
+            ? 'entered via the sub-nav tab, already in Intelligent search mode ' +
+                '("Aller à la recherche basique" is visible).'
+            : 'entered via the sub-nav tab; neither mode-switch link was found.'
       );
-      if (!switchedToIntelligent) {
+      if (!switchedToIntelligent && !alreadyIntelligent) {
         // Diagnostic only, not a failure path: dump what role="button"/role="link" elements
         // actually exist right now, to see why the "Aller à la recherche intelligente" locator
         // didn't match one even though a live DOM dump showed it present as a
