@@ -116,12 +116,20 @@ function spawnScript(current, command, args, options) {
 // job index in the requested range (see the root CLAUDE.md's "jobup.ch CV-match automation"
 // section for the full split). Parses its stdout JSON the same defensive way every other script
 // invocation in this file does: default to a "nothing happened" shape if parsing fails.
-async function runSearchScript(current, useBasicSearch, searchTerm, locations, useJobsCh) {
+async function runSearchScript(current, useBasicSearch, searchTerm, locations, useJobsCh, cdiOnly, cddOnly) {
   var scriptPath = path.join(APP_ROOT, 'scripts', 'jobup-search.js');
   var spawned = await spawnScript(
     current,
     'node',
-    [scriptPath, String(useBasicSearch), searchTerm, JSON.stringify(locations), String(useJobsCh)],
+    [
+      scriptPath,
+      String(useBasicSearch),
+      searchTerm,
+      JSON.stringify(locations),
+      String(useJobsCh),
+      String(cdiOnly),
+      String(cddOnly)
+    ],
     {
       // Raised from 90s: confirmed live, the sub-nav-tab fallback path (25s + 15s + 10s CTA waits
       // before even reaching the tab, then mode detection, the profile-button re-check, and the
@@ -342,7 +350,9 @@ router.post('/login', function(req, res) {
  * `ignoreYellowMeter` exactly as the single-job endpoint used to (see git history / CLAUDE.md for
  * their individual meanings — unchanged by this split), plus `useJobsCh`: drives www.jobs.ch
  * instead of www.jobup.ch for this request's search + every one of its workers (see the frontend's
- * "Use www.jobs.ch" checkbox and CLAUDE.md's "jobup.ch CV-match automation" section).
+ * "Use www.jobs.ch" checkbox and CLAUDE.md's "jobup.ch CV-match automation" section), and
+ * `cdiOnly`/`cddOnly`: restrict the search to "Durée indéterminée"/"Temporaire" contract types
+ * via the results page's "Type de contrat" filter (both false = no contract-type filter at all).
  *
  * Responds with `{ success, errorMessage, totalJobsCount, resultsUrl, results }`:
  * - `totalJobsCount`/`resultsUrl` come from the one-time search and are included whenever the
@@ -376,6 +386,8 @@ router.post('/cv-match', async function(req, res) {
   var easyApply = !!(req.body && req.body.easyApply);
   var ignoreYellowMeter = !!(req.body && req.body.ignoreYellowMeter);
   var useJobsCh = !!(req.body && req.body.useJobsCh);
+  var cdiOnly = !!(req.body && req.body.cdiOnly);
+  var cddOnly = !!(req.body && req.body.cddOnly);
   var startJobIndex = Number(req.body && req.body.startJobIndex);
   var endJobIndex = Number(req.body && req.body.endJobIndex);
 
@@ -383,7 +395,7 @@ router.post('/cv-match', async function(req, res) {
   runningCvMatch = current;
 
   try {
-    var searchResult = await runSearchScript(current, useBasicSearch, searchTerm, locations, useJobsCh);
+    var searchResult = await runSearchScript(current, useBasicSearch, searchTerm, locations, useJobsCh, cdiOnly, cddOnly);
 
     if (!searchResult.success) {
       return sendJsonIfStillConnected(res, {

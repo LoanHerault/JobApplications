@@ -204,6 +204,8 @@ export class App {
   protected readonly locationInput = signal('');
   protected readonly useJobsCh = signal(false);
   protected readonly useBasicSearch = signal(false);
+  protected readonly cdiOnly = signal(false);
+  protected readonly cddOnly = signal(false);
   protected readonly saveJob = signal(false);
   protected readonly easyApply = signal(false);
   protected readonly ignoreYellowMeter = signal(false);
@@ -328,6 +330,14 @@ export class App {
     this.useBasicSearch.set((event.target as HTMLInputElement).checked);
   }
 
+  protected onCdiOnlyChange(event: Event): void {
+    this.cdiOnly.set((event.target as HTMLInputElement).checked);
+  }
+
+  protected onCddOnlyChange(event: Event): void {
+    this.cddOnly.set((event.target as HTMLInputElement).checked);
+  }
+
   protected onSaveJobChange(event: Event): void {
     this.saveJob.set((event.target as HTMLInputElement).checked);
     this.resetIgnoreYellowMeterIfMoot();
@@ -394,6 +404,8 @@ export class App {
         startJobIndex: this.startJobIndex(),
         endJobIndex: this.endJobIndex(),
         useBasicSearch: this.useBasicSearch(),
+        cdiOnly: this.cdiOnly(),
+        cddOnly: this.cddOnly(),
         searchTerm: trimmedSearchTerm,
         locations,
         saveJob: this.saveJob(),

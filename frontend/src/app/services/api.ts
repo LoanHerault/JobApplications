@@ -62,6 +62,8 @@ export class Api {
     startJobIndex: number;
     endJobIndex: number;
     useBasicSearch: boolean;
+    cdiOnly: boolean;
+    cddOnly: boolean;
     searchTerm: string;
     locations: string[];
     saveJob: boolean;

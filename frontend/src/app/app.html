@@ -138,6 +138,26 @@
             />
             Use basic search
           </label>
+          <label for="cdi-only" class="job-filters-option">
+            <input
+              id="cdi-only"
+              type="checkbox"
+              [checked]="cdiOnly()"
+              (change)="onCdiOnlyChange($event)"
+              [disabled]="cvMatchPending()"
+            />
+            CDI Only
+          </label>
+          <label for="cdd-only" class="job-filters-option">
+            <input
+              id="cdd-only"
+              type="checkbox"
+              [checked]="cddOnly()"
+              (change)="onCddOnlyChange($event)"
+              [disabled]="cvMatchPending()"
+            />
+            CDD Only
+          </label>
           <label for="save-job" class="job-filters-option">
             <input
               id="save-job"

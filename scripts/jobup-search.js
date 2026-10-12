@@ -26,6 +26,8 @@
  * other selector/flow in this file and jobup-cv-match.js is assumed to carry over unchanged between
  * the two (unverified live — jobs.ch and jobup.ch are sister sites under the same company, but no
  * jobs.ch session was available in this environment to confirm its markup actually matches).
+ * `process.argv[6]`/`process.argv[7]` (`'true'`/`'1'`) are "CDI only"/"CDD only": either one set
+ * applies the results page's "Type de contrat" filter (see applyContractTypeFilter()).
  *
  * On success, saves the authenticated browser context's `storageState` (cookies + localStorage)
  * to a temp JSON file so each per-job worker can load it into its own fresh browser and start
@@ -95,7 +97,91 @@ function appendLocations(url, locations) {
   }
 }
 
-async function runSearch(email, password, useBasicSearch, searchTerm, locations, useJobsCh) {
+// `employment-type` query-param values matching the "Type de contrat" options: 5 = "Durée
+// indéterminée" (CDI), 1 = "Temporaire" (CDD).
+const EMPLOYMENT_TYPE_CDI = '5';
+const EMPLOYMENT_TYPE_CDD = '1';
+
+function employmentTypeValues(cdiOnly, cddOnly) {
+  const values = [];
+  if (cdiOnly) values.push(EMPLOYMENT_TYPE_CDI);
+  if (cddOnly) values.push(EMPLOYMENT_TYPE_CDD);
+  return values;
+}
+
+// Restricts the already-rendered results to the requested contract type(s) through the results
+// page's own "Type de contrat" dropdown: opens it, checks "Durée indéterminée" (CDI) and/or
+// "Temporaire" (CDD), then clicks "Appliquer". Selectors come from user-supplied DOM snippets:
+// the trigger is `<div role="button" title="Type de contrat">`; each option is a
+// `[data-cy="facet-checkbox"]` row whose `<label title="Durée indéterminée">` wraps a visually
+// hidden (0x0, opacity 0) `<input type="checkbox">`, so the label is what gets clicked while the
+// input is only read for its checked state; "Appliquer" is `[data-cy="filter-submit"]`. Clickable
+// locators are scoped to :visible, since jobup.ch duplicates its filter markup for responsive
+// layouts (see CLAUDE.md's filter-bar gotcha). Not yet confirmed in a live run. Returns whether the
+// filter was applied; dumps the dropdown's candidate elements to stderr on any miss so the
+// selectors can be fixed from real evidence.
+async function applyContractTypeFilter(page, { cdiOnly, cddOnly }) {
+  const wanted = [
+    { label: 'Durée indéterminée', checked: cdiOnly },
+    { label: 'Temporaire', checked: cddOnly }
+  ];
+
+  async function dumpCandidates(reason) {
+    const candidates = await page
+      .locator('[role="button"], [data-cy="facet-checkbox"], [data-cy="filter-submit"], button, label')
+      .evaluateAll((els) =>
+        els
+          .filter((el) => /contrat|indéterminée|temporaire|appliquer/i.test(el.textContent + ' ' + (el.getAttribute('title') || '')))
+          .filter((el) => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length))
+          .slice(0, 20)
+          .map((el) => el.outerHTML.slice(0, 300))
+      )
+      .catch(() => []);
+    console.error('contract-type filter: ' + reason + ' Visible candidates:', JSON.stringify(candidates));
+  }
+
+  const trigger = page.locator('[role="button"][title="Type de contrat"]:visible').first();
+  try {
+    await trigger.waitFor({ state: 'visible', timeout: 10000 });
+  } catch {
+    await dumpCandidates('"Type de contrat" button not found.');
+    return false;
+  }
+  await trigger.click();
+
+  for (const { label, checked } of wanted) {
+    const optionLabel = page.locator('[data-cy="facet-checkbox"] label[title="' + label + '"]:visible').first();
+    try {
+      await optionLabel.waitFor({ state: 'visible', timeout: 5000 });
+    } catch {
+      await dumpCandidates('option "' + label + '" not found.');
+      return false;
+    }
+    // Only toggle when the state differs from what's wanted — this also unchecks an option left
+    // checked by persisted account/browser state. isChecked() works on the hidden input.
+    const isChecked = await optionLabel.locator('input[type="checkbox"]').isChecked();
+    if (isChecked !== checked) {
+      await optionLabel.click();
+    }
+    console.error(
+      'contract-type filter: "' + label + '" ' + (checked ? 'checked' : 'unchecked') +
+        (isChecked === checked ? ' (already in that state).' : '.')
+    );
+  }
+
+  const applyButton = page.locator('[data-cy="filter-submit"]:visible').first();
+  try {
+    await applyButton.waitFor({ state: 'visible', timeout: 5000 });
+  } catch {
+    await dumpCandidates('"Appliquer" button not found.');
+    return false;
+  }
+  await applyButton.click();
+  console.error('contract-type filter: clicked "Appliquer".');
+  return true;
+}
+
+async function runSearch(email, password, useBasicSearch, searchTerm, locations, useJobsCh, cdiOnly, cddOnly) {
   const effectiveSearchTerm = searchTerm && searchTerm.trim() ? searchTerm.trim() : RECOVERY_SEARCH_TERM;
   const filteredLocations = (Array.isArray(locations) ? locations : [])
     .map((location) => String(location).trim())
@@ -468,6 +554,42 @@ async function runSearch(email, password, useBasicSearch, searchTerm, locations,
       );
     }
 
+    // "CDI Only"/"CDD Only" on the frontend: applied here, after every navigation above (so a
+    // later page.goto() can't discard it) and before the job count/resultsUrl are read below (so
+    // both reflect the filtered results, and every worker starts from the filtered URL). Neither
+    // checked = no contract-type filter at all, same as before this option existed. A failure to
+    // apply it fails the search outright rather than silently analyzing unfiltered jobs.
+    if (cdiOnly || cddOnly) {
+      const urlBeforeFilter = page.url();
+      if (!(await applyContractTypeFilter(page, { cdiOnly, cddOnly }))) {
+        return {
+          success: false,
+          errorMessage: 'Could not apply the contract type filter',
+          totalJobsCount: null,
+          resultsUrl: page.url(),
+          storageStatePath: null
+        };
+      }
+      // Short wait only — the URL may legitimately not change if jobup.ch keeps the filter in
+      // client state, which the explicit employment-type params below compensate for.
+      await page.waitForURL((url) => url.toString() !== urlBeforeFilter, { timeout: 5000 }).catch(() => {});
+      await waitForJobResults(page, anyJobResult, '1 (with contract type)');
+
+      // Workers only load resultsUrl, so the filter must be in the URL itself, not just in the
+      // page's client state: set exactly the requested `employment-type` params (one repeated
+      // param per type, like `location=`), replacing whatever "Appliquer" may have put there.
+      const contractTypeUrl = new URL(page.url());
+      contractTypeUrl.searchParams.delete('employment-type');
+      for (const value of employmentTypeValues(cdiOnly, cddOnly)) {
+        contractTypeUrl.searchParams.append('employment-type', value);
+      }
+      if (contractTypeUrl.toString() !== page.url()) {
+        console.error('contract-type filter: navigating to the results URL with employment-type params set.');
+        await page.goto(contractTypeUrl.toString());
+        await waitForJobResults(page, anyJobResult, '1 (with employment-type params)');
+      }
+    }
+
     // The total match count ("<N> offres d'emploi") appears as text near the top of the results
     // page and stays constant across pagination, so it's read once here. Not critical to the rest
     // of the flow — if it can't be found/parsed, this just logs and moves on with `null` rather
@@ -572,6 +694,8 @@ if (require.main === module) {
       locations = [];
     }
     const useJobsCh = process.argv[5] === 'true' || process.argv[5] === '1';
+    const cdiOnly = process.argv[6] === 'true' || process.argv[6] === '1';
+    const cddOnly = process.argv[7] === 'true' || process.argv[7] === '1';
     // Same site-matching credential pair as scripts/jobup-login.js's own CLI block — routes/api.js
     // reads and overrides the matching pair fresh from .env on every request (see its own
     // readCurrentJobupCredentials()) so a login done through either checkbox is picked up here.
@@ -589,7 +713,7 @@ if (require.main === module) {
     }
 
     try {
-      const result = await runSearch(email, password, useBasicSearch, searchTerm, locations, useJobsCh);
+      const result = await runSearch(email, password, useBasicSearch, searchTerm, locations, useJobsCh, cdiOnly, cddOnly);
       process.stdout.write(JSON.stringify(result));
     } catch (err) {
       // Deliberately not a raw `console.error(err)` — see scripts/jobup-login.js's matching
