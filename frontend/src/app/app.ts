@@ -1,8 +1,13 @@
-import { afterNextRender, Component, HostListener, inject, signal } from '@angular/core';
+import { afterNextRender, Component, ElementRef, HostListener, inject, signal, viewChild } from '@angular/core';
 import { RouterOutlet } from '@angular/router';
 import { Subscription } from 'rxjs';
 
 import { Api, AnalysisCriterion, AnalysisMeter, CvMatchJobResult } from './services/api';
+
+function parseJobIndex(raw: string): number {
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : 0;
+}
 
 type AnalysisListItem = { text: string; status: 'green' | 'yellow' | 'gray' | null };
 
@@ -246,10 +251,19 @@ export class App {
   // unsubscribe) so that stale response can never overwrite the state reset below it.
   private cvMatchSubscription: Subscription | null = null;
 
+  private readonly jobupEmailInput = viewChild<ElementRef<HTMLInputElement>>('jobupEmailInput');
+  private readonly jobupPasswordInput = viewChild<ElementRef<HTMLInputElement>>('jobupPasswordInput');
+  private readonly loginUseJobsChInput = viewChild<ElementRef<HTMLInputElement>>('loginUseJobsChInput');
+  private readonly searchTermInput = viewChild<ElementRef<HTMLInputElement>>('searchTermInput');
+  private readonly locationInputEl = viewChild<ElementRef<HTMLInputElement>>('locationInputEl');
+  private readonly startJobIndexInput = viewChild<ElementRef<HTMLInputElement>>('startJobIndexInput');
+  private readonly endJobIndexInput = viewChild<ElementRef<HTMLInputElement>>('endJobIndexInput');
+
   constructor() {
     // Deferred to the browser only: at build time `ng build` prerenders this route with no
     // backend running, so an HTTP call made directly in the constructor breaks the build.
     afterNextRender(() => {
+      this.syncSignalsFromInputs();
       this.api.getHealth().subscribe({
         next: () => this.backendStatus.set('connected'),
         error: () => this.backendStatus.set('unreachable')
@@ -277,6 +291,9 @@ export class App {
   // well-formed email, so this never even runs in that case — no custom validation logic needed.
   protected onLoginSubmit(event: Event): void {
     event.preventDefault();
+    // Re-synced here too, not just on init: Chrome withholds an autofilled password's value from
+    // scripts until the user first interacts with the page, so the init sync can read it as empty.
+    this.syncSignalsFromInputs();
     this.onLoginClick();
   }
 
@@ -304,14 +321,36 @@ export class App {
       });
   }
 
+  // The inputs only push into their signals on (input)/(change) events, but the browser can fill
+  // them without firing one: restoring form state on reload/back navigation, autofill (notably
+  // saved email/password), or the user typing into the server-rendered HTML before hydration.
+  // Without this, the signals would keep their defaults and the login/search would silently ignore
+  // what the inputs actually show. The "Job filters" checkboxes don't need this: they're inside an
+  // @if that's closed on load, so they don't exist yet and always render from their signals.
+  private syncSignalsFromInputs(): void {
+    const syncValue = (ref: ElementRef<HTMLInputElement> | undefined, apply: (v: string) => void) => {
+      if (ref) {
+        apply(ref.nativeElement.value);
+      }
+    };
+    syncValue(this.jobupEmailInput(), (v) => this.jobupEmail.set(v));
+    syncValue(this.jobupPasswordInput(), (v) => this.jobupPassword.set(v));
+    syncValue(this.searchTermInput(), (v) => this.searchTerm.set(v));
+    syncValue(this.locationInputEl(), (v) => this.locationInput.set(v));
+    syncValue(this.startJobIndexInput(), (v) => this.startJobIndex.set(parseJobIndex(v)));
+    syncValue(this.endJobIndexInput(), (v) => this.endJobIndex.set(parseJobIndex(v)));
+    const loginUseJobsCh = this.loginUseJobsChInput();
+    if (loginUseJobsCh) {
+      this.loginUseJobsCh.set(loginUseJobsCh.nativeElement.checked);
+    }
+  }
+
   protected onStartJobIndexInput(event: Event): void {
-    const value = Number((event.target as HTMLInputElement).value);
-    this.startJobIndex.set(Number.isFinite(value) ? value : 0);
+    this.startJobIndex.set(parseJobIndex((event.target as HTMLInputElement).value));
   }
 
   protected onEndJobIndexInput(event: Event): void {
-    const value = Number((event.target as HTMLInputElement).value);
-    this.endJobIndex.set(Number.isFinite(value) ? value : 0);
+    this.endJobIndex.set(parseJobIndex((event.target as HTMLInputElement).value));
   }
 
   protected onSearchTermInput(event: Event): void {
@@ -393,6 +432,7 @@ export class App {
   }
 
   protected onCvMatchClick(): void {
+    this.syncSignalsFromInputs();
     this.resetCvMatchState(true);
     const trimmedSearchTerm = this.searchTerm().trim();
     const locations = this.locationInput()

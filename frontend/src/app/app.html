@@ -13,6 +13,7 @@
       <label for="jobup-email">Email :</label>
       <input
         id="jobup-email"
+        #jobupEmailInput
         type="email"
         required
         class="login-email-input"
@@ -23,6 +24,7 @@
       <label for="jobup-password">Password :</label>
       <input
         id="jobup-password"
+        #jobupPasswordInput
         type="password"
         required
         class="login-password-input"
@@ -33,6 +35,7 @@
       <label for="login-use-jobs-ch" class="login-use-jobs-ch">
         <input
           id="login-use-jobs-ch"
+          #loginUseJobsChInput
           type="checkbox"
           [checked]="loginUseJobsCh()"
           (change)="onLoginUseJobsChChange($event)"
@@ -54,6 +57,7 @@
       <label for="search-term">Search term :</label>
       <input
         id="search-term"
+        #searchTermInput
         type="text"
         maxlength="255"
         class="cv-match-search-term-input"
@@ -64,6 +68,7 @@
       <label for="location">Locations :</label>
       <input
         id="location"
+        #locationInputEl
         type="text"
         maxlength="255"
         class="cv-match-location-input"
@@ -76,6 +81,7 @@
     <label for="start-job-index">Start job index :</label>
     <input
       id="start-job-index"
+      #startJobIndexInput
       type="number"
       [value]="startJobIndex()"
       (input)="onStartJobIndexInput($event)"
@@ -84,6 +90,7 @@
     <label for="end-job-index">End job index :</label>
     <input
       id="end-job-index"
+      #endJobIndexInput
       type="number"
       [value]="endJobIndex()"
       (input)="onEndJobIndexInput($event)"
