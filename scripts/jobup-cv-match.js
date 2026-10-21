@@ -1049,28 +1049,77 @@ async function runCvMatchJob(resultsUrl, storageStatePath, jobIndex, saveJob, ea
 
     await selectedJob.click();
 
-    // A job jobup.ch's AI already analyzed before shows "Voir l'analyse" (read the existing
-    // result) instead of "Voir mon match" (run a new analysis, then "Continuer" to confirm).
-    // Confirmed live: for an already-analyzed job, no element on the page contains the text
-    // "match" at all, so a plain role/name locator for "Voir mon match" times out — that's not a
-    // broken selector, it's this other, already-analyzed state.
-    const alreadyAnalyzedButton = page.getByRole('button', { name: /voir l'analyse/i });
-    const newAnalysisButton = page.getByRole('button', { name: /voir mon match/i });
+    // The CV-match entry point, renamed on both jobup.ch and jobs.ch (confirmed by the user,
+    // 2026-10-21, with screenshots and outerHTML; the dialogs behind them are unchanged):
+    //   - "Voir mon match"  -> "Voir si je corresponds à ce poste" / "Comparez votre CV aux
+    //     exigences du poste": `<button data-cy="jobfit-teaser-cta">` — starts a NEW analysis
+    //     (then "Continuer" to confirm, as before).
+    //   - "Voir l'analyse"  -> "Mon match" + a `data-cy="jobfit-teaser-label"` verdict pill ("Match
+    //     faible"/"Match modéré"/...) + "Voir vos atouts et nos conseils":
+    //     `<button data-cy="jobfit-teaser-analysed-<verdict>">` (seen: -poor, -moderate) — opens
+    //     the EXISTING analysis.
+    // Both are matched by data-cy since neither accessible name is stable (the new wording is long,
+    // and "Mon match" carries a per-job verdict pill). The old "Voir l'analyse"/"Voir mon match"
+    // buttons are no longer matched at all — if one ever reappears (e.g. a gradual rollout), the
+    // "found neither" diagnostic below will show it. `:visible`-scoped — jobup.ch duplicates
+    // markup for responsive layouts, and an unscoped `.first()` can resolve to a hidden copy and
+    // wait out its timeout on it.
+    const existingAnalysisButton = page.locator('[data-cy^="jobfit-teaser-analysed"]:visible');
+    const newAnalysisButton = page.locator('[data-cy="jobfit-teaser-cta"]:visible');
+    const continueButton = page
+      .getByRole('button', { name: 'Continuer', exact: true })
+      .and(page.locator(':visible'));
 
     const which = await Promise.race([
-      alreadyAnalyzedButton.first().waitFor({ state: 'visible', timeout: 20000 }).then(() => 'already'),
+      existingAnalysisButton.first().waitFor({ state: 'visible', timeout: 20000 }).then(() => 'existing'),
       newAnalysisButton.first().waitFor({ state: 'visible', timeout: 20000 }).then(() => 'new'),
     ]).catch(() => null);
 
     let analysis;
     let meter;
     let criteria;
-    if (which === 'already') {
-      await alreadyAnalyzedButton.first().click();
+    if (which === 'existing') {
+      console.error(
+        'opening the existing CV match ("Mon match", data-cy="' +
+          (await existingAnalysisButton.first().getAttribute('data-cy')) +
+          '").'
+      );
+      await existingAnalysisButton.first().click();
       ({ analysis, meter, criteria } = await readAnalysisAndClose(page, 20000));
     } else if (which === 'new') {
-      await newAnalysisButton.first().click();
-      await page.getByRole('button', { name: 'Continuer', exact: true }).click();
+      // Gotcha, confirmed live (2026-10-21, "devops"/Genève jobIndex 1–10): the detail pane shows
+      // "Voir si je corresponds à ce poste" FIRST even for an already-analyzed job, and only swaps
+      // it for "Mon match" once the job's match status has loaded — so winning the race above
+      // doesn't prove the job is new. Observed in that run: some already-analyzed jobs were clicked
+      // before the swap (the click then opened the existing analysis modal directly, no
+      // "Continuer"), and two were swapped between the race and the click (a click bound to
+      // `jobfit-teaser-cta` alone then waited out 30s on an element that no longer existed). So
+      // click whichever of the two buttons is visible at click time, then race "Continuer" (new
+      // analysis) against the analysis modal opening directly (existing analysis).
+      const eitherButton = existingAnalysisButton.or(newAnalysisButton);
+      const clickedDataCy = await eitherButton.first().getAttribute('data-cy', { timeout: 10000 });
+      await eitherButton.first().click({ timeout: 10000 });
+      const afterClick = await Promise.race([
+        continueButton.first().waitFor({ state: 'visible', timeout: 15000 }).then(() => 'continue'),
+        page
+          .locator('[data-cy="jobfit-analysis-modal"]:visible')
+          .first()
+          .waitFor({ state: 'visible', timeout: 15000 })
+          .then(() => 'modal'),
+      ]).catch(() => null);
+      console.error(
+        'clicked the CV-match button (data-cy="' +
+          clickedDataCy +
+          '"): ' +
+          (afterClick === 'continue'
+            ? 'new analysis, clicking "Continuer".'
+            : afterClick === 'modal'
+              ? 'the existing analysis opened directly (job already analyzed).'
+              : 'neither "Continuer" nor the analysis modal appeared within 15s; waiting for the result anyway.')
+      );
+      if (afterClick === 'continue') {
+        await continueButton.first().click();
+      }
       // The AI analysis can take a while to run; wait generously for "Fermer" to appear, since
       // that signals the result is ready to read (handled inside readAnalysisAndClose()).
       // Confirmed live: a batch of 5 workers hitting jobs.ch's AI analysis concurrently can push
@@ -1110,21 +1159,47 @@ async function runCvMatchJob(resultsUrl, storageStatePath, jobIndex, saveJob, ea
         const seen = new Set();
         for (const el of els) {
           const v = el.getAttribute('data-cy');
-          if (v && /match|analys|cv/i.test(v)) seen.add(v);
+          if (v && /match|analys|cv|jobfit|teaser/i.test(v)) seen.add(v);
         }
         return [...seen];
       });
-      const buttonTexts = await page.getByRole('button').evaluateAll((els) =>
-        els.slice(0, 30).map((el) => el.textContent?.trim().slice(0, 60))
+      // Every element mentioning "match" (any tag, not just buttons — the first 30 buttons on the
+      // page are all header/search chrome, so the job detail pane's controls never showed up here),
+      // with its tag, role and data-cy, so a renamed/re-tagged CV-match control is identifiable.
+      const buttonTexts = await page.locator('button, a, [role="button"], [data-cy]').evaluateAll((els) =>
+        els
+          .filter((el) => /match/i.test(el.textContent || '') && el.getBoundingClientRect().width > 0)
+          .slice(0, 15)
+          .map((el) => ({
+            tag: el.tagName.toLowerCase(),
+            role: el.getAttribute('role'),
+            dataCy: el.getAttribute('data-cy'),
+            text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80)
+          }))
       );
       console.error(
-        'found neither "Voir l\'analyse" nor "Voir mon match". Current URL:',
+        'found neither "Mon match" nor "Voir si je corresponds à ce poste". Current URL:',
         page.url(),
         'Candidate data-cy values:',
         JSON.stringify(matchCandidates),
-        'Visible button texts:',
+        'Visible elements mentioning "match":',
         JSON.stringify(buttonTexts)
       );
+      // Dump the jobfit teaser(s) themselves — visibility plus truncated outerHTML — so a future
+      // rename of the CV-match buttons shows up directly in the logs (this is how the 2026-10-21
+      // "Voir si je corresponds à ce poste"/"Mon match" rename was identified).
+      const jobfitTeasers = await page.locator('[data-cy^="jobfit-teaser"]').evaluateAll((els) =>
+        els.slice(0, 5).map((el) => {
+          const rect = el.getBoundingClientRect();
+          return {
+            dataCy: el.getAttribute('data-cy'),
+            visible: rect.width > 0 && rect.height > 0,
+            text: (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200),
+            outerHTML: el.outerHTML.replace(/<svg[\s\S]*?<\/svg>/g, '<svg/>').slice(0, 1500)
+          };
+        })
+      );
+      console.error('jobfit teaser elements:', JSON.stringify(jobfitTeasers));
       throw new Error('Could not find either the "already analyzed" or "new analysis" button');
     }
 
