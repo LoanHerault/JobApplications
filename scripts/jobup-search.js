@@ -109,6 +109,111 @@ function employmentTypeValues(cdiOnly, cddOnly) {
   return values;
 }
 
+// Submits the basic-search UI's search (only called on the useBasicSearch path, after its term field
+// has been filled; every other path searches via the results URL directly) and waits until it has
+// actually run. Confirmed live (2026-11-25): a visible job card is not proof a search ran, since
+// the bare `/fr/emplois/` landing page renders a stray one by itself ("0 offres d'emploi"); trusting
+// it once sent every worker to the bare URL with 0 jobs. So "the search ran" means the URL carries a
+// non-empty `term` param. The button is matched as an exact "Recherche"/"Rechercher" (anchored so it
+// can't match "Rechercher avec mon profil"), and must be visible and not under an `inert` ancestor
+// (any open modal makes the rest of the page inert). On failure, it dumps the page state and throws.
+const CLICK_TIMEOUT_MS = 5000;
+
+const isInert = (locator) => locator.evaluate((el) => !!el.closest('[inert]')).catch(() => true);
+const isUsableNow = async (locator) => (await locator.isVisible().catch(() => false)) && !(await isInert(locator));
+
+// Records fetch/XHR responses and browser console errors/warnings while the search is submitted, so
+// a failure shows what the page actually did. This is how the blocked AI profile-search calls were
+// found (see the skippedProfileSearch comment in runSearch()).
+function startSearchDiagnostics(page) {
+  const network = [];
+  const consoleMessages = [];
+  const onResponse = (response) => {
+    const request = response.request();
+    if (!['xhr', 'fetch'].includes(request.resourceType())) return;
+    network.push({ t: new Date().toISOString().slice(11, 19), method: request.method(), status: response.status(), url: response.url().slice(0, 160) });
+  };
+  const onRequestFailed = (request) => {
+    if (!['xhr', 'fetch'].includes(request.resourceType())) return;
+    network.push({ t: new Date().toISOString().slice(11, 19), method: request.method(), failed: request.failure()?.errorText, url: request.url().slice(0, 160) });
+  };
+  const onConsole = (msg) => {
+    if (['error', 'warning'].includes(msg.type())) consoleMessages.push(msg.type() + ': ' + msg.text().slice(0, 200));
+  };
+  page.on('response', onResponse);
+  page.on('requestfailed', onRequestFailed);
+  page.on('console', onConsole);
+  return {
+    network,
+    consoleMessages,
+    stop() {
+      page.off('response', onResponse);
+      page.off('requestfailed', onRequestFailed);
+      page.off('console', onConsole);
+    },
+  };
+}
+
+async function dumpSearchStateAndThrow(page, reason, diagnostics) {
+  diagnostics.stop();
+  const buttons = await page.locator('button, [role="button"]').evaluateAll((els) =>
+    els
+      .filter((el) => el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+      .slice(0, 40)
+      .map((el) => ({
+        tag: el.tagName,
+        text: (el.textContent || '').trim().slice(0, 60),
+        ariaLabel: el.getAttribute('aria-label'),
+        dataCy: el.getAttribute('data-cy'),
+        type: el.getAttribute('type'),
+        inert: !!el.closest('[inert]'),
+      }))
+  );
+  const screenshotPath = path.join(os.tmpdir(), 'jobup-search-failure-' + Date.now() + '.png');
+  const screenshotSaved = await page
+    .screenshot({ path: screenshotPath })
+    .then(() => true)
+    .catch(() => false);
+  console.error(reason + ' Current URL:', page.url(), 'Visible buttons:', JSON.stringify(buttons));
+  console.error('fetch/XHR activity while submitting (last 40):', JSON.stringify(diagnostics.network.slice(-40)));
+  console.error('browser console errors/warnings (last 20):', JSON.stringify(diagnostics.consoleMessages.slice(-20)));
+  console.error(screenshotSaved ? 'screenshot of the page at failure: ' + screenshotPath : 'could not save a failure screenshot.');
+  throw new Error('Could not submit the job search');
+}
+
+async function submitSearchIfNeeded(page) {
+  const searchButton = page
+    .getByRole('button', { name: /^recherch(e|er)$/i })
+    .and(page.locator(':visible'))
+    .first();
+  const hasTerm = () => !!new URL(page.url()).searchParams.get('term');
+  const diagnostics = startSearchDiagnostics(page);
+
+  const timeout = 30000;
+  const deadline = Date.now() + timeout;
+  let clickedSearch = false;
+  while (Date.now() < deadline) {
+    if (!clickedSearch && (await isUsableNow(searchButton))) {
+      await searchButton.click({ timeout: CLICK_TIMEOUT_MS });
+      clickedSearch = true;
+      console.error('clicked the "Recherche" button to submit the search.');
+    }
+    if (hasTerm()) {
+      console.error('the search ran (URL has a term).');
+      diagnostics.stop();
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  await dumpSearchStateAndThrow(
+    page,
+    clickedSearch
+      ? 'clicked "Recherche" but the URL never got a `term` param within ' + timeout / 1000 + 's.'
+      : 'the search never ran: no usable "Recherche" button appeared and the URL never got a `term` param.',
+    diagnostics
+  );
+}
+
 // Restricts the already-rendered results to the requested contract type(s) through the results
 // page's own "Type de contrat" dropdown: opens it, checks "Durée indéterminée" (CDI) and/or
 // "Temporaire" (CDD), then clicks "Appliquer". Selectors come from user-supplied DOM snippets:
@@ -295,7 +400,18 @@ async function runSearch(email, password, useBasicSearch, searchTerm, locations,
     }
 
     console.error('entered search flow via path:', searchWithProfilePath);
-    await searchWithProfileButton.click();
+    // "Rechercher avec mon profil" is deliberately NOT clicked on the cta/role paths. Confirmed live
+    // (2026-11-25): it now opens a CV-selection modal whose "Créer ma recherche" calls jobup.ch's AI
+    // service (`ai-proxy-api.jobup.ch/cv-to-search-query`, then `/candidate-to-search-query`) to
+    // generate the search description, and both calls are blocked by CORS in this automated
+    // browser (apparently bot detection: the site tags it `HeadlessChrome` / "suspect"). So the
+    // description never arrives. Getting around that bot protection was ruled out, and the user
+    // chose to skip the AI profile search here: these paths now search with the caller's term and
+    // locations through the results URL instead (see skippedProfileSearch below).
+    const skippedProfileSearch = searchWithProfilePath === 'cta' || searchWithProfilePath === 'role';
+    if (!skippedProfileSearch) {
+      await searchWithProfileButton.click();
+    }
 
     // Declared up front (not just plain values yet — Playwright locators are lazy, they don't
     // require the page to be in any particular state until actually awaited) so the recovery
@@ -304,6 +420,17 @@ async function runSearch(email, password, useBasicSearch, searchTerm, locations,
     const dataCyJobLinks = page.locator('[data-cy="job-link"]:visible');
     const articleJobLinks = page.getByRole('article');
     const anyJobResult = dataCyJobLinks.or(articleJobLinks);
+
+    // Navigates straight to the results URL with `term`/`location` query params set: the reliable
+    // mechanism already used for location filtering and pagination elsewhere in this file, and the
+    // only way to search without the AI profile search (see skippedProfileSearch above).
+    async function searchViaResultsUrl(label) {
+      const url = new URL(BASE_URL + JOBS_PATH);
+      url.searchParams.set('term', effectiveSearchTerm);
+      appendLocations(url, effectiveLocations);
+      await page.goto(url.toString());
+      await waitForJobResults(page, anyJobResult, '1 (' + label + ')');
+    }
 
     // jobup.ch's `/fr/emplois/` page can independently load in "Intelligent search" mode (the
     // AI free-text "Décris ton rôle idéal :" UI) or "Basic search" mode (the classic, filter-based
@@ -350,6 +477,16 @@ async function runSearch(email, password, useBasicSearch, searchTerm, locations,
     // Set when the recovery branch below navigates directly via URL instead of filling a term
     // field and clicking "Recherche" through the UI — see why in that branch's comment.
     let skipSearchSubmit = false;
+
+    if (skippedProfileSearch) {
+      console.error(
+        'skipping the AI "Rechercher avec mon profil" search (its AI service is blocked in this ' +
+          'browser); searching via the results URL with term "' + effectiveSearchTerm + '" and locations ' +
+          JSON.stringify(effectiveLocations) + ' instead.'
+      );
+      await searchViaResultsUrl('term+location via URL, profile search skipped');
+      skipSearchSubmit = true;
+    }
 
     if (useBasicSearch) {
       // "Use basic search" checked: go straight to Basic search mode (click "Aller à la
@@ -415,63 +552,18 @@ async function runSearch(email, password, useBasicSearch, searchTerm, locations,
         );
       }
 
-      // Same ambiguous-accessible-name issue as searchWithProfileByRole above — this also matches
-      // the hidden nested button inside the "Ouvrir Recherche" dropdown, so the standalone CTA
-      // (data-cy first, role .last() as fallback) is targeted the same way, not .first().
-      const profileButtonByDataCyInIntelligentMode = page.locator('[data-cy="search-with-profile-button-cta"]');
-      const profileButtonByRoleInIntelligentMode = page.getByRole('button', { name: /rechercher avec mon profil/i });
-      let profileButtonInIntelligentMode = null;
-      if (
-        await profileButtonByDataCyInIntelligentMode
-          .waitFor({ state: 'visible', timeout: 10000 })
-          .then(() => true)
-          .catch(() => false)
-      ) {
-        profileButtonInIntelligentMode = profileButtonByDataCyInIntelligentMode;
-      } else if (
-        await profileButtonByRoleInIntelligentMode
-          .last()
-          .waitFor({ state: 'visible', timeout: 5000 })
-          .then(() => true)
-          .catch(() => false)
-      ) {
-        profileButtonInIntelligentMode = profileButtonByRoleInIntelligentMode.last();
-      }
-      const foundProfileButton = profileButtonInIntelligentMode !== null;
-
-      if (foundProfileButton) {
-        console.error(
-          'entered via the sub-nav tab; found "Rechercher avec mon profil" in ' +
-            'Intelligent search mode, using the same flow as the direct-CTA path from here.'
-        );
-        await profileButtonInIntelligentMode.click();
-        searchWithProfilePath = 'cta (via subNavTab detour)';
-      } else {
-        // Confirmed live via a user-supplied screenshot: Intelligent search mode's own term/
-        // location fields work fine with a manually-typed term (not just a profile-derived one),
-        // and its results are broader than Basic search mode's for the same term/location — so
-        // this deliberately stays in Intelligent search mode rather than switching to Basic search
-        // mode (which an earlier version of this code did, needlessly narrowing the results).
-        // But confirmed live, staying here and trying to fill a term field through the UI (the
-        // way the old Basic-search recovery did) doesn't reliably work: the landing state right
-        // after entering via the sub-nav tab can be the true free-text AI page (no matching
-        // input/combobox/textbox at all, and no "Recherche" button either — not the term+location
-        // dual-field layout the screenshot showed, which is what you get once a search has
-        // actually been run). So skip UI interaction entirely here and navigate straight to the
-        // results URL with `term`/`location` query params set, the same reliable mechanism
-        // already used for location filtering and pagination elsewhere in this file.
-        console.error(
-          'entered via the sub-nav tab; "Rechercher avec mon profil" not available ' +
-            'in Intelligent search mode either, navigating directly to the Intelligent-search results ' +
-            'URL with the effective search term/locations instead of filling fields through the UI.'
-        );
-        const recoveryUrl = new URL(page.url());
-        recoveryUrl.searchParams.set('term', effectiveSearchTerm);
-        appendLocations(recoveryUrl, effectiveLocations);
-        await page.goto(recoveryUrl.toString());
-        await waitForJobResults(page, anyJobResult, '1 (recovery term+location via URL)');
-        skipSearchSubmit = true;
-      }
+      // No "Rechercher avec mon profil" detour here any more: that button's AI profile search is
+      // blocked in this browser (see skippedProfileSearch above). Search with the effective term and
+      // locations via the results URL instead. Confirmed live earlier: Intelligent search mode's
+      // results are broader than Basic search mode's for the same term/location, and filling its
+      // fields through the UI isn't reliable from a fresh landing (no term field or "Recherche"
+      // button until a search has run), so this navigates directly rather than typing.
+      console.error(
+        'entered via the sub-nav tab; navigating directly to the results URL with the effective ' +
+          'search term/locations.'
+      );
+      await searchViaResultsUrl('recovery term+location via URL');
+      skipSearchSubmit = true;
     }
 
     // On the basic-search recovery UI, fill in the effective search term so the search isn't
@@ -512,17 +604,14 @@ async function runSearch(email, password, useBasicSearch, searchTerm, locations,
       }
     }
 
+    // Submit the search with "Recherche" if the page still needs it, then wait for page 1's
+    // results to actually render before reading the URL below — jobup.ch syncs it (adding the
+    // real `term`) asynchronously after "Recherche"; reading it too early was confirmed live to
+    // capture a stale/bare `term=` (see CLAUDE.md's pagination gotcha) and lock that in
+    // permanently once we navigate again below. Skipped when skipSearchSubmit is set — the
+    // recovery branch above already waited for results after its own direct navigation.
     if (!skipSearchSubmit) {
-      await page.getByRole('button', { name: /^recherche$/i }).click();
-    }
-
-    // Wait for page 1's results to actually render before reading the URL below — jobup.ch syncs
-    // it (adding the real `term`) asynchronously after "Recherche"; reading it too early was
-    // confirmed live to capture a stale/bare `term=` (see CLAUDE.md's pagination gotcha, which hit
-    // the exact same issue for a different reason) and lock that in permanently once we navigate
-    // again below. Skipped when skipSearchSubmit is set — the recovery branch above already waited
-    // for results after its own direct navigation.
-    if (!skipSearchSubmit) {
+      await submitSearchIfNeeded(page);
       await waitForJobResults(page, anyJobResult, '1');
     }
 
@@ -539,7 +628,7 @@ async function runSearch(email, password, useBasicSearch, searchTerm, locations,
     // pagination finding), not something fixable by adjusting the URL. **Known limitation**: use
     // `useBasicSearch` (the frontend's "Use basic search" checkbox) for a location-filtered
     // search; the direct-CTA path's results are profile/term-matched but not location-narrowed.
-    if (searchWithProfilePath.startsWith('subNavTab')) {
+    if (searchWithProfilePath.startsWith('subNavTab') || skippedProfileSearch) {
       const locationUrl = new URL(page.url());
       if (!locationUrl.searchParams.get('location')) {
         appendLocations(locationUrl, effectiveLocations);
